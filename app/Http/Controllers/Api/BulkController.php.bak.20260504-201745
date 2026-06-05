@@ -1,0 +1,678 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Smstransaction;
+use App\Models\Smstesttransactions;
+use App\Http\Requests\Bulkrequest;
+use App\Models\User;
+use App\Models\App;
+use App\Models\Device;
+use App\Models\Contact;
+use App\Models\Template;
+use App\Models\Reply;
+use App\Models\Webhook;
+use App\Models\ChatbotSession;
+use App\Models\ChatbotLead;
+use App\Models\ChatbotHandoff;
+use Carbon\Carbon;
+use App\Traits\Whatsapp;
+use Http;
+use Auth;
+use Str;
+use DB;
+use Session;
+class BulkController extends Controller
+{
+    use Whatsapp;
+
+    
+    /**
+     * sent message
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function submitRequest(Bulkrequest $request)
+    {
+
+       
+        $user=User::where('status',1)->where('will_expire','>',now())->where('authkey',$request->authkey)->first();
+        $app=App::where('key',$request->appkey)->whereHas('device')->with('device')->where('status',1)->first();
+
+        if ($user == null || $app == null) {
+            return response()->json(['error'=>'Invalid Auth and AppKey'],401);
+        }
+
+        // El plan Starlink (id=4) es exclusivo para alertas del software Appogio GPS.
+        // No puede usarse desde esta API externa.
+        if ($user->plan_id == 4) {
+            return response()->json([
+                'error' => 'Este plan es exclusivo para notificaciones del sistema GPS Appogio. Para usar la API, adquiere un plan BASICO o EMPRESA.',
+            ], 403);
+        }
+
+        if (getUserPlanData('messages_limit', $user->id) == false) {
+            return response()->json([
+                'message'=>__('Maximum Monthly Messages Limit Exceeded')
+            ],401);  
+        }
+
+        if (!empty($request->template_id)) {
+
+            $template = Template::where('user_id',$user->id)->where('uuid',$request->template_id)->where('status',1)->first();
+            if (empty($template)) {
+                return response()->json(['error'=>'Template Not Found'],401);
+            }
+
+            if (isset($template->body['text'])) {
+                $body = $template->body;
+                $text=$this->formatText($template->body['text'],[],$user);
+                $text=$this->formatCustomText($text,$request->variables ?? []);
+                $body['text'] = $text;
+            }
+            else{
+                $body=$template->body;
+            }
+            $type = $template->type;
+
+            
+        }
+        else{
+            
+            $text=$this->formatText($request->message);
+            if(!empty($request->file)){
+               
+           
+                    $explode=explode('.', $request->file);
+                    $file_type=strtolower(end($explode));
+                    $extentions=[
+                        'jpg'=>'image',
+                        'jpeg'=>'image',
+                        'png'=>'image',
+                        'webp'=>'image',
+                        'pdf'=>'document',
+                        'docx'=>'document',
+                        'xlsx'=>'document',
+                        'csv'=>'document',
+                        'txt'=>'document'
+                    ];
+                   
+                    if(!isset($extentions[$file_type])){
+                        $validators['error'] = 'file type should be jpg,jpeg,png,webp,pdf,docx,xlsx,csv,txt';
+                        return response()->json($validators,403);
+                    }
+
+                
+                $body[$extentions[$file_type]]=['url' => $request->file];
+                $body['caption'] = $text;
+                $type='text-with-media';
+            }
+            else{
+                $body['text'] = $text;
+                $type='plain-text';
+            }
+            
+        }
+
+        if (!isset($body)) {
+            return response()->json(['error'=>'Request Failed'],401);
+        }    
+
+        try {
+
+            $response= $this->messageSend($body,$app->device_id,$request->to,$type,true);
+
+            if ($response['status'] == 200) {
+                
+                $logs['user_id']=$user->id;
+                $logs['device_id']=$app->device_id;
+                $logs['app_id']=$app->id;
+                $logs['from']=$app->device->phone ?? null;
+                $logs['to']=$request->to;
+                $logs['template_id']=$template->id ?? null;
+                $logs['type']='from_api';
+
+                $this->saveLog($logs);
+
+                return response()->json(['message_status'=>'Success','data'=>[
+                    'from'=>$app->device->phone ?? null,
+                    'to'=>$request->to,                
+                    'status_code'=>200,
+                ]],200);
+            }
+            else{
+                return response()->json(['error'=>'Request Failed'],401);
+
+            }
+
+        } catch (Exception $e) {
+
+         return response()->json(['error'=>'Request Failed'],401);
+     }
+
+ }
+
+
+ /**
+  * set status device
+  * @param  \Illuminate\Http\Request  $request
+  * @return \Illuminate\Http\Response
+  */
+  public function setStatus($device_id,$status){
+
+       $device_id=str_replace('device_','',$device_id);
+
+       $device=Device::where('id',$device_id)->first();
+       if (!empty($device)) {
+          $device->status=$status;
+          $device->save();
+       }
+
+
+  }
+
+
+  /**
+  * receive webhook response
+  * @param  \Illuminate\Http\Request  $request
+  * @return \Illuminate\Http\Response
+  */
+  public function webHook(Request $request, $device_id)
+  {
+      $session    = $device_id;
+      $device_id  = (int) str_replace('device_', '', $device_id);
+
+      $device = Device::with('user')
+          ->whereHas('user', fn($q) => $q->where('will_expire', '>', now()))
+          ->where('id', $device_id)
+          ->first();
+
+      // ── Actualización de estado de conexión ────────────────────────
+      if ($request->type === 'CONNECTION_UPDATE') {
+          if (isset($request->data['connection']) && $device) {
+              $device->status = $request->data['connection'] === 'open' ? 1 : 0;
+              $device->save();
+          }
+          return response()->json(['ok' => true]);
+      }
+
+      if (!$device) {
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Extraer remitente ───────────────────────────────────────────
+      $jid  = $request->data[0]['key']['remoteJidAlt'] ?? '';
+      if (!$jid) return response()->json(['ok' => true]);
+
+      // Ignorar mensajes de grupos y broadcast
+      if (str_contains($jid, '@g.us') || str_contains($jid, '@broadcast')) {
+          return response()->json(['ok' => true]);
+      }
+
+      $from = str_ends_with($jid, '@lid')
+          ? $jid
+          : (explode('@', $jid)[0] ?? null);
+
+      if (!$from) return response()->json(['ok' => true]);
+
+      // ── Extraer texto (incluyendo respuestas interactivas) ──────────
+      $interactive = $request->data[0]['_interactive'] ?? null; // añadido por Node.js
+
+      $message = trim(
+          $interactive['selectedText']
+          ?? $interactive['selectedId']
+          ?? $request->data[0]['message']['conversation']
+          ?? $request->data[0]['message']['extendedTextMessage']['text']
+          ?? ''
+      );
+
+      // También guardar el ID seleccionado para matching exacto en flujos
+      $selectedId = $interactive['selectedId'] ?? null;
+
+      // ── Guardar en hook externo si está configurado ─────────────────
+      if ($device->hook_url && isset($request->data[0]['message'])) {
+          $hook            = new Webhook;
+          $hook->device_id = $device->id;
+          $hook->user_id   = $device->user_id;
+          $hook->payload   = json_encode([
+              'payload'  => $request->all(),
+              'sender'   => $from,
+              'receiver' => $device->phone ?? '',
+          ]);
+          $hook->hook = $device->hook_url;
+          $hook->save();
+      }
+
+      if ($message === '' && !$selectedId) {
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Sesión del contacto (crea si no existe) ─────────────────────
+      $isNew       = !ChatbotSession::where('device_id', $device->id)->where('contact', $from)->exists();
+      $chatSession = ChatbotSession::firstOrNew(['device_id' => $device->id, 'contact' => $from]);
+      if ($isNew) {
+          $chatSession->is_new_contact = 1;
+          $chatSession->save();
+      }
+
+      // ── Si el bot está pausado (handoff activo), no responder ───────
+      if ($chatSession->is_paused) {
+          // Verificar si el agente escribió #bot para reactivar
+          if (strtolower(trim($message)) === '#bot') {
+              $chatSession->is_paused = 0;
+              $chatSession->save();
+              $this->sendRawText($device, $from, '✅ Bot reactivado. El asistente automático vuelve a estar activo.');
+          }
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Captura de campo en progreso ────────────────────────────────
+      if ($chatSession->capturing_field && $message !== '') {
+          $this->processCaptureField($device, $from, $message, $chatSession, $session);
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Buscar regla que coincida ───────────────────────────────────
+      // Si hay un selectedId de interactivo, usarlo primero como coincidencia exacta
+      $reply = null;
+      if ($selectedId) {
+          $reply = $this->findMatchingReply($device->id, $selectedId, $chatSession);
+      }
+      if (!$reply && $message !== '') {
+          $reply = $this->findMatchingReply($device->id, $message, $chatSession);
+      }
+
+      // ── Mensaje de bienvenida para primer contacto ──────────────────
+      if (!$reply && $chatSession->is_new_contact) {
+          $reply = Reply::where('device_id', $device->id)
+              ->whereNull('parent_reply_id')
+              ->where('match_type', 'first_contact')
+              ->with('template')
+              ->orderByDesc('priority')
+              ->first();
+      }
+
+      if (!$reply) {
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Verificar horario de atención ──────────────────────────────
+      if ($reply->schedule_enabled) {
+          $now       = Carbon::now();
+          $days      = explode(',', $reply->schedule_days ?? '1,2,3,4,5,6,7');
+          $dayOfWeek = $now->isoFormat('E');
+          $inSchedule = in_array($dayOfWeek, $days)
+              && $now->format('H:i:s') >= ($reply->schedule_start ?? '00:00:00')
+              && $now->format('H:i:s') <= ($reply->schedule_end   ?? '23:59:59');
+          if (!$inSchedule) {
+              if ($reply->out_of_hours_reply) {
+                  $this->sendRawText($device, $from, $reply->out_of_hours_reply);
+              }
+              return response()->json(['ok' => true]);
+          }
+      }
+
+      // ── Verificar cooldown ──────────────────────────────────────────
+      if ($reply->cooldown_minutes > 0 && $chatSession->last_reply_at) {
+          $next = Carbon::parse($chatSession->last_reply_at)->addMinutes($reply->cooldown_minutes);
+          if (Carbon::now()->lt($next)) return response()->json(['ok' => true]);
+      }
+
+      // ── Verificar only_once ─────────────────────────────────────────
+      if ($reply->only_once && in_array($reply->id, $chatSession->getRepliedIdsArray())) {
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Disparar handoff si corresponde ────────────────────────────
+      if ($reply->trigger_handoff) {
+          $this->triggerHandoff($device, $from, $message, $chatSession);
+          $body = ['text' => $this->personalizeText($reply->reply ?? '', $chatSession)];
+          $this->dispatchReply($device, $from, $body, 'plain-text', $chatSession, $reply, $session);
+          return response()->json(['ok' => true]);
+      }
+
+      // ── Si la regla captura un campo, preparar la siguiente pregunta ─
+      if ($reply->capture_field) {
+          $chatSession->capturing_field = $reply->capture_field;
+          // No guardamos todavía, dispatchReply lo hará
+      }
+
+      // ── Preparar y enviar respuesta ─────────────────────────────────
+      $this->buildAndDispatch($device, $from, $reply, $chatSession, $session);
+
+      return response()->json(['ok' => true]);
+  }
+
+  // ============================================================
+  //  MÉTODOS AUXILIARES DEL CHATBOT
+  // ============================================================
+
+  /**
+   * Construye el mensaje y lo envía según el tipo de la regla
+   * (texto, template, lista interactiva, botones).
+   */
+  private function buildAndDispatch(Device $device, string $from, Reply $reply,
+                                    ChatbotSession $session, string $sessionId): void
+  {
+      $replyText = $this->personalizeText($reply->reply ?? '', $session);
+
+      // Mensaje interactivo tipo LISTA
+      if ($reply->interactive_type === 'list') {
+          $opts     = json_decode($reply->interactive_options ?? '[]', true);
+          $sections = [];
+          $rows     = [];
+          foreach ($opts as $opt) {
+              $rows[] = [
+                  'rowId'       => $opt['id']          ?? Str::slug($opt['text'] ?? ''),
+                  'title'       => $opt['text']         ?? '',
+                  'description' => $opt['description']  ?? '',
+              ];
+          }
+          $sections[] = ['title' => '', 'rows' => $rows];
+
+          Http::post(env('WA_SERVER_URL') . '/chats/send-list?id=device_' . $device->id, [
+              'receiver'   => $from,
+              'title'      => $replyText,
+              'body'       => $reply->reply_footer ?? '',
+              'buttonText' => $reply->button_label ?? 'Ver opciones',
+              'sections'   => $sections,
+          ]);
+
+          $this->finishDispatch($device, $from, $session, $reply);
+          return;
+      }
+
+      // Mensaje interactivo tipo BOTONES
+      if ($reply->interactive_type === 'buttons') {
+          $opts    = json_decode($reply->interactive_options ?? '[]', true);
+          $buttons = array_map(fn($o) => [
+              'id'   => $o['id']   ?? Str::slug($o['text'] ?? ''),
+              'text' => $o['text'] ?? '',
+          ], $opts);
+
+          Http::post(env('WA_SERVER_URL') . '/chats/send-buttons?id=device_' . $device->id, [
+              'receiver' => $from,
+              'text'     => $replyText,
+              'buttons'  => array_slice($buttons, 0, 3),
+          ]);
+
+          $this->finishDispatch($device, $from, $session, $reply);
+          return;
+      }
+
+      // Mensaje con template
+      if ($reply->reply_type === 'template' && $reply->template) {
+          $template = $reply->template;
+          $body     = $template->body;
+          if (isset($body['text'])) {
+              $body['text'] = $this->personalizeText($body['text'], $session);
+          }
+          $this->messageSend($body, $device->id, $from, $template->type, true, 0, true);
+          $this->finishDispatch($device, $from, $session, $reply, $template->id ?? null);
+          return;
+      }
+
+      // Texto plano
+      $this->messageSend(['text' => $replyText], $device->id, $from, 'plain-text', true, 0, true);
+      $this->finishDispatch($device, $from, $session, $reply);
+  }
+
+  /**
+   * Actualiza la sesión y guarda el log después de enviar.
+   */
+  private function finishDispatch(Device $device, string $from, ChatbotSession $session,
+                                   Reply $reply, ?int $templateId = null): void
+  {
+      $hasChildren = Reply::where('parent_reply_id', $reply->id)->exists();
+      $session->current_reply_id = $hasChildren ? $reply->id : null;
+      $session->last_reply_at    = now();
+      $session->is_new_contact   = 0;
+      if ($reply->only_once) $session->addRepliedId($reply->id);
+      if (!$reply->capture_field) $session->capturing_field = null;
+      $session->save();
+
+      $this->saveLog([
+          'user_id'     => $device->user_id,
+          'device_id'   => $device->id,
+          'from'        => $device->phone ?? null,
+          'to'          => $from,
+          'type'        => 'chatbot',
+          'template_id' => $templateId,
+      ]);
+  }
+
+  /**
+   * Procesa la captura de un campo de lead cuando el bot está esperando respuesta.
+   */
+  private function processCaptureField(Device $device, string $from, string $value,
+                                        ChatbotSession $session, string $sessionId): void
+  {
+      $field = $session->capturing_field;
+
+      // Obtener o crear el lead
+      $lead = ChatbotLead::firstOrNew(['device_id' => $device->id, 'contact' => $from]);
+      $lead->user_id = $device->user_id;
+      $lead->setDataField($field, $value);
+      $lead->save();
+
+      // Sincronizar lead_data en la sesión
+      $leadData         = json_decode($session->lead_data ?? '{}', true);
+      $leadData[$field] = $value;
+      $session->lead_data      = json_encode($leadData, JSON_UNESCAPED_UNICODE);
+      $session->capturing_field = null;
+
+      // Avanzar al siguiente paso en el flujo (si hay una regla hija de tipo capture siguiente)
+      if ($session->current_reply_id) {
+          $nextCapture = Reply::where('device_id', $device->id)
+              ->where('parent_reply_id', $session->current_reply_id)
+              ->whereNotNull('capture_field')
+              ->orderByDesc('priority')
+              ->first();
+
+          if ($nextCapture) {
+              $session->capturing_field = $nextCapture->capture_field;
+              $session->save();
+              $this->buildAndDispatch($device, $from, $nextCapture, $session, $sessionId);
+              return;
+          }
+      }
+
+      $session->save();
+  }
+
+  /**
+   * Dispara la transferencia a agente humano.
+   */
+  private function triggerHandoff(Device $device, string $from, string $lastMessage,
+                                   ChatbotSession $session): void
+  {
+      $session->is_paused = 1;
+      $session->save();
+
+      // Registrar el handoff
+      $handoff              = new ChatbotHandoff;
+      $handoff->device_id   = $device->id;
+      $handoff->contact     = $from;
+      $handoff->last_message = $lastMessage;
+      $handoff->status      = 'pending';
+      $handoff->user_id     = $device->user_id;
+      $handoff->save();
+
+      // Notificar al número de agente configurado en meta del dispositivo
+      $meta        = json_decode($device->meta ?? '{}', true);
+      $agentNumber = $meta['agent_number'] ?? null;
+
+      if ($agentNumber) {
+          $leadData = json_decode($session->lead_data ?? '{}', true);
+          $nombre   = $leadData['nombre'] ?? $leadData['name'] ?? $from;
+          $text     = "🔔 *Solicitud de atención*\n"
+                    . "👤 Contacto: {$nombre} ({$from})\n"
+                    . "💬 Último mensaje: {$lastMessage}\n"
+                    . "📱 Dispositivo: {$device->name}\n\n"
+                    . "Responde directamente a este número o escribe *#bot* al chat para reactivar el bot.";
+
+          Http::post(env('WA_SERVER_URL') . '/chats/send?id=device_' . $device->id, [
+              'receiver' => $agentNumber,
+              'message'  => ['text' => $text],
+          ]);
+      }
+  }
+
+  /**
+   * Envía texto plano directamente sin pasar por el sistema de reglas.
+   */
+  private function sendRawText(Device $device, string $to, string $text): void
+  {
+      $this->messageSend(['text' => $text], $device->id, $to, 'plain-text', true, 0, true);
+  }
+
+  /**
+   * Reemplaza variables en el texto de respuesta con datos reales del contacto/sesión.
+   */
+  private function personalizeText(string $text, ChatbotSession $session): string
+  {
+      $leadData = json_decode($session->lead_data ?? '{}', true);
+      $now      = Carbon::now();
+      $days     = ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'];
+
+      $vars = [
+          '{nombre}'   => $leadData['nombre']   ?? $leadData['name'] ?? $session->contact,
+          '{email}'    => $leadData['email']     ?? '',
+          '{telefono}' => $session->contact,
+          '{fecha}'    => $now->format('d/m/Y'),
+          '{hora}'     => $now->format('H:i'),
+          '{dia}'      => $days[$now->isoFormat('E')] ?? '',
+          '{mes}'      => $now->locale('es')->isoFormat('MMMM'),
+      ];
+
+      return str_replace(array_keys($vars), array_values($vars), $text);
+  }
+
+  /**
+   * Busca la regla que corresponde al mensaje recibido.
+   * Primero revisa las reglas hijas del flujo activo;
+   * si no hay coincidencia, busca en las reglas de nivel superior.
+   */
+  private function findMatchingReply(int $deviceId, string $message, ChatbotSession $session): ?Reply
+  {
+      // 1. Si el contacto está dentro de un flujo, buscar en reglas hijas
+      if ($session->current_reply_id) {
+          $reply = $this->matchReply(
+              Reply::where('device_id', $deviceId)
+                   ->where('parent_reply_id', $session->current_reply_id)
+                   ->orderByDesc('priority'),
+              $message
+          );
+          if ($reply) return $reply;
+
+          // No coincidió con ninguna opción del flujo: cerrar el flujo
+          $session->current_reply_id = null;
+      }
+
+      // 2. Buscar en reglas de nivel superior (sin padre)
+      return $this->matchReply(
+          Reply::where('device_id', $deviceId)
+               ->whereNull('parent_reply_id')
+               ->orderByDesc('priority'),
+          $message
+      );
+  }
+
+  /**
+   * Aplica los distintos tipos de coincidencia a un query de Reply.
+   */
+  private function matchReply($query, string $message): ?Reply
+  {
+      $msgLower = mb_strtolower(trim($message));
+
+      $rules = $query->with('template')->get();
+
+      foreach ($rules as $rule) {
+          $keyword = mb_strtolower(trim($rule->keyword ?? ''));
+          if ($keyword === '') continue;
+
+          $matched = match ($rule->match_type) {
+              // Coincidencia exacta (insensible a mayúsculas)
+              'equal'       => $msgLower === $keyword
+                               || $this->keywordInList($keyword, $msgLower),
+
+              // El mensaje EMPIEZA con la palabra clave
+              'starts_with' => str_starts_with($msgLower, $keyword),
+
+              // La palabra clave aparece como palabra completa en el mensaje
+              'contains'    => (bool) preg_match(
+                                   '/\b' . preg_quote($keyword, '/') . '\b/ui',
+                                   $msgLower
+                               ),
+
+              // Expresión regular
+              'regex'       => (bool) @preg_match('/' . $rule->keyword . '/ui', $message),
+
+              // Cualquier mensaje (respuesta por defecto / fallback)
+              'any'         => true,
+
+              // Compatibilidad con 'like' anterior (palabra similar)
+              'like'        => (bool) preg_match(
+                                   '/\b' . preg_quote($keyword, '/') . '/ui',
+                                   $msgLower
+                               ),
+
+              default       => false,
+          };
+
+          if ($matched) return $rule;
+      }
+
+      return null;
+  }
+
+  /** Verifica si $needle está en una lista separada por comas */
+  private function keywordInList(string $list, string $needle): bool
+  {
+      foreach (explode(',', $list) as $item) {
+          if (mb_strtolower(trim($item)) === $needle) return true;
+      }
+      return false;
+  }
+
+  /**
+   * Envía el mensaje, guarda log y actualiza la sesión del contacto.
+   */
+  private function dispatchReply(
+      Device $device,
+      string $from,
+      array $body,
+      string $type,
+      ChatbotSession $session,
+      ?Reply $reply,
+      string $sessionId
+  ): void {
+      $this->messageSend($body, $device->id, $from, $type, true, 0, true);
+
+      $logs = [
+          'user_id'     => $device->user_id,
+          'device_id'   => $device->id,
+          'from'        => $device->phone ?? null,
+          'to'          => $from,
+          'type'        => 'chatbot',
+          'template_id' => $reply?->template_id ?? null,
+      ];
+      $this->saveLog($logs);
+
+      if ($reply) {
+          // Actualizar sesión: si esta regla tiene hijos, el contacto entra al flujo
+          $hasChildren = Reply::where('parent_reply_id', $reply->id)->exists();
+          $session->current_reply_id = $hasChildren ? $reply->id : null;
+          $session->last_reply_at    = now();
+
+          if ($reply->only_once) {
+              $session->addRepliedId($reply->id);
+          }
+
+          $session->save();
+      }
+  }
+}
