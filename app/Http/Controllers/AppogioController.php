@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\RateLimiter;
 use Carbon\Carbon;
 use Http;
+use App\Services\AlertDispatcherService;
 
 class AppogioController extends Controller
 {
@@ -234,14 +235,50 @@ class AppogioController extends Controller
 
         // Construir mensaje
         $customMessage = $request->input('message');
-        $messageText   = $customMessage ?: $this->buildAlertMessage($request, $app->title);
 
-        // Enviar a uno o varios números
+        // Si el usuario YA configuró plantillas o reglas, usar el dispatcher multi-canal.
+        // Si no, comportamiento legacy zero-downtime.
+        $hasCustomConfig = \App\Models\AlertTemplate::where('user_id', $app->user_id)->exists()
+            || \App\Models\AlertRule::where('user_id', $app->user_id)->exists();
+
+        if ($hasCustomConfig && !$customMessage) {
+            $payload = [
+                'unit'    => $request->input('unit', 'N/A'),
+                'event'   => $request->input('event', 'default'),
+                'speed'   => $request->input('speed'),
+                'lat'     => $request->input('lat'),
+                'lng'     => $request->input('lng'),
+                'address' => $request->input('address'),
+                'time'    => $request->input('time', now()->format('Y-m-d H:i:s')),
+                'brand'   => $app->title,
+            ];
+
+            $destinations = [];
+            foreach (array_map('trim', explode(',', $to)) as $entry) {
+                if (empty($entry)) continue;
+                if (str_contains($entry, '@')) {
+                    $destinations[] = ['channel' => 'email', 'to' => $entry];
+                } elseif (str_starts_with($entry, 'tg:')) {
+                    $destinations[] = ['channel' => 'telegram', 'to' => substr($entry, 3)];
+                } elseif (str_starts_with($entry, 'sms:')) {
+                    $destinations[] = ['channel' => 'sms', 'to' => preg_replace('/\D/', '', substr($entry, 4))];
+                } else {
+                    $destinations[] = ['channel' => 'whatsapp', 'to' => preg_replace('/\D/', '', $entry)];
+                }
+            }
+
+            $r = (new AlertDispatcherService())->dispatch($app, $payload, $destinations);
+            return response()->json(['success' => true, 'dispatch' => $r]);
+        }
+
+        // Legacy: construcción de mensaje fijo + solo WhatsApp
+        $messageText = $customMessage ?: $this->buildAlertMessage($request, $app->title);
+
         $recipients = array_map('trim', explode(',', $to));
         $results    = [];
 
         foreach ($recipients as $phone) {
-            $phone = preg_replace('/\D/', '', $phone); // solo dígitos
+            $phone = preg_replace('/\D/', '', $phone);
             if (empty($phone)) continue;
 
             $response = Http::post(
@@ -462,21 +499,21 @@ class AppogioController extends Controller
         $brand      = !empty($appTitle) ? $appTitle : 'Alerta GPS';
 
         $lines   = [];
-        $lines[] = "🚨 *{$brand}*";
-        $lines[] = "📦 *Unidad:* {$unit}";
-        $lines[] = "⚡ *Evento:* {$eventLabel}";
+        $lines[] = "*{$brand}*";
+        $lines[] = "*Unidad:* {$unit}";
+        $lines[] = "*Evento:* {$eventLabel}";
 
         if ($speed !== null && $speed !== '') {
-            $lines[] = "🚗 *Velocidad:* {$speed} km/h";
+            $lines[] = "*Velocidad:* {$speed} km/h";
         }
         if ($address) {
-            $lines[] = "📍 *Dirección:* {$address}";
+            $lines[] = "*Dirección:* {$address}";
         }
         if ($lat && $lng) {
-            $lines[] = "🗺 *Mapa:* https://maps.google.com/?q={$lat},{$lng}";
+            $lines[] = "*Mapa:* https://maps.google.com/?q={$lat},{$lng}";
         }
 
-        $lines[] = "🕐 *Hora:* {$time}";
+        $lines[] = "*Hora:* {$time}";
 
         return implode("\n", $lines);
     }

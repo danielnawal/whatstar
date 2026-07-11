@@ -112,6 +112,10 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
 
     sessions.set(sessionId, { ...wa, store })
 
+    // Flag: se activa en cuanto el usuario escanea el QR o inicia el pairing code.
+    // Impide que el handler de QR borre la sesión mientras el handshake está en curso.
+    let authInProgress = false
+
     if (options.usePairingCode && !wa.authState.creds.registered) {
         if (!wa.authState.creds.account) {
             await wa.waitForConnectionUpdate((update) => {
@@ -119,6 +123,7 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
             })
             const code = await wa.requestPairingCode(options.phoneNumber)
             if (res && !res.headersSent && code !== undefined) {
+                authInProgress = true
                 response(res, 200, true, 'Verify on your phone and enter the provided code.', { code })
             } else {
                 response(res, 500, false, 'Unable to create session.')
@@ -126,7 +131,10 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
         }
     }
 
-    wa.ev.on('creds.update', saveCreds)
+    wa.ev.on('creds.update', () => {
+        authInProgress = true
+        saveCreds()
+    })
 
    
 
@@ -314,8 +322,6 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
 
         if (qr) {
             if (res && !res.headersSent) {
-            
-
                 try {
                     const qrcode = await toDataURL(qr)
                     response(res, 200, true, 'QR code received, please scan the QR code.', { qrcode })
@@ -323,6 +329,12 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
                 } catch {
                     response(res, 500, false, 'Unable to create QR code.')
                 }
+            }
+
+            // No borrar si: ya está autenticado, el usuario ya escaneó (authInProgress),
+            // o el handshake de creds ya empezó.
+            if (authInProgress || wa.authState?.creds?.registered || wa.user) {
+                return
             }
 
             try {

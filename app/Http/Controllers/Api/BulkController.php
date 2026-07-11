@@ -130,7 +130,11 @@ class BulkController extends Controller
 
             $response= $this->messageSend($body,$app->device_id,$request->to,$type,true);
 
-            if ($response['status'] == 200) {
+            if (!is_array($response)) {
+                return response()->json(['error'=>'Device not connected or unavailable'],422);
+            }
+
+            if (($response['status'] ?? null) == 200) {
                 
                 $logs['user_id']=$user->id;
                 $logs['device_id']=$app->device_id;
@@ -153,7 +157,7 @@ class BulkController extends Controller
 
             }
 
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
 
          return response()->json(['error'=>'Request Failed'],401);
      }
@@ -172,11 +176,81 @@ class BulkController extends Controller
 
        $device=Device::where('id',$device_id)->first();
        if (!empty($device)) {
+          $wasConnected = (int) $device->status === 1;
           $device->status=$status;
           $device->save();
+
+          // Aviso de desconexión al número que configuró el cliente (solo en la
+          // transición conectado -> desconectado, para no repetir avisos).
+          if ($wasConnected && (int) $status === 0 && !empty($device->disconnect_alert_number)) {
+              try { $this->notifyDisconnect($device); } catch (\Throwable $e) { /* nunca romper el webhook */ }
+          }
        }
 
 
+  }
+
+  /**
+   * Envía un aviso de "tu número se desconectó" al número configurado por el
+   * cliente. Se envía desde OTRO número activo (nunca desde el que se cayó):
+   * primero un número notificador del sistema (env DISCONNECT_NOTIFIER_DEVICE_ID),
+   * si no, otro dispositivo activo del mismo usuario.
+   */
+  private function notifyDisconnect($device)
+  {
+      $to = preg_replace('/\D+/', '', (string) $device->disconnect_alert_number);
+      $name = $device->name ?: ('device ' . $device->id);
+
+      // Idioma de la cuenta: portugués si el número del bot o el destino es de Brasil (+55).
+      $devPhone = preg_replace('/\D+/', '', (string) $device->phone);
+      $isBrazil = (strpos($devPhone, '55') === 0) || (strpos($to, '55') === 0);
+
+      if ($isBrazil) {
+          $waText = "\u{1F6A8} *Suas alertas de WhatsApp foram desconectadas. Reconecte agora.*\n\n"
+                  . "O numero \"{$name}\", que e o telefone de alertas da sua plataforma GPS, perdeu a conexao e parou de enviar alertas.\n"
+                  . "Para reativar, entre em \"Saude dos bots\" ou \"Meus Dispositivos\" e escaneie o codigo QR (leva 1 minuto, voce nao perde regras nem contatos).";
+          $mailSubject = 'Suas alertas de WhatsApp foram desconectadas';
+      } else {
+          $waText = "\u{1F6A8} *Se desconectaron tus alertas de WhatsApp. Reconecta ahora.*\n\n"
+                  . "El numero \"{$name}\", que es el telefono de alertas de tu plataforma GPS, perdio la conexion y dejo de enviar alertas.\n"
+                  . "Para reactivarlo entra a \"Salud de bots\" o \"Mis Dispositivos\" y escanea el codigo QR (toma 1 minuto, no pierdes reglas ni contactos).";
+          $mailSubject = 'Se desconectaron tus alertas de WhatsApp';
+      }
+
+      // 1) WhatsApp: desde un número activo distinto del que se cayó.
+      if ($to !== '') {
+          $senderId = null;
+          $notifier = env('DISCONNECT_NOTIFIER_DEVICE_ID');
+          if (!empty($notifier)) {
+              $n = Device::where('id', $notifier)->where('status', 1)->first();
+              if ($n) { $senderId = $n->id; }
+          }
+          if (!$senderId) {
+              $other = Device::where('user_id', $device->user_id)
+                  ->where('status', 1)->where('id', '!=', $device->id)->first();
+              if ($other) { $senderId = $other->id; }
+          }
+          if ($senderId) {
+              // instant=true evita el sleep (esto corre dentro del webhook que envía node).
+              try { $this->messageSend(['text' => $waText], $senderId, $to, 'plain-text', true, 0, true); }
+              catch (\Throwable $e) { \Log::warning('[disconnect-alert] fallo WhatsApp', ['e' => $e->getMessage()]); }
+          } else {
+              \Log::warning('[disconnect-alert] sin remitente WhatsApp activo', ['device' => $device->id]);
+          }
+      }
+
+      // 2) Refuerzo por correo al email de la cuenta (llega aunque WhatsApp falle).
+      try {
+          $user = User::where('id', $device->user_id)->first();
+          if ($user && !empty($user->email)) {
+              $emailBody = str_replace(['*', "\u{1F6A8} "], '', $waText);
+              \Illuminate\Support\Facades\Mail::raw($emailBody, function ($m) use ($user, $mailSubject) {
+                  $m->to($user->email)->subject($mailSubject);
+              });
+          }
+      } catch (\Throwable $e) {
+          \Log::warning('[disconnect-alert] fallo email', ['e' => $e->getMessage()]);
+      }
   }
 
 
@@ -224,6 +298,15 @@ class BulkController extends Controller
 
       // Ignorar mensajes de grupos y broadcast
       if (str_contains($jid, '@g.us') || str_contains($jid, '@broadcast')) {
+          return response()->json(['ok' => true]);
+      }
+      // Detección extra de grupos modernos (WhatsApp ahora usa @lid o sufijo vacío
+      // para algunos grupos). Los IDs de grupo siempre empiezan con "120363" o
+      // tienen el formato antiguo "<digits>-<digits>" antes del @.
+      $baseId = explode('@', $jid)[0];
+      if (str_starts_with($baseId, '120363')
+          || (preg_match('/^\d+-\d+$/', $baseId))
+          || (ctype_digit($baseId) && strlen($baseId) >= 17)) {
           return response()->json(['ok' => true]);
       }
 
@@ -339,6 +422,12 @@ class BulkController extends Controller
       $chatSession = ChatbotSession::firstOrNew(['device_id' => $device->id, 'contact' => $from]);
       if ($isNew) {
           $chatSession->is_new_contact = 1;
+          $chatSession->save();
+      }
+
+      // ── Números con código de país +55 (Brasil) → portugués fijo ────
+      if (!$chatSession->locked_language && ctype_digit($from) && str_starts_with($from, '55')) {
+          $chatSession->locked_language = 'pt';
           $chatSession->save();
       }
 
@@ -1577,6 +1666,18 @@ class BulkController extends Controller
    */
   private function sendRawText(Device $device, string $to, string $text): void
   {
+      // Anti-duplicado: si la MISMA respuesta se envió a este contacto en los
+      // últimos 10 min, no la repite. Evita loops cuando el AI genera la misma
+      // respuesta para mensajes similares o cuando un contacto manda repetidos.
+      $cacheKey = 'sendraw:' . $device->id . ':' . md5($to . '|' . $text);
+      if (\Illuminate\Support\Facades\Cache::has($cacheKey)) {
+          \Illuminate\Support\Facades\Log::info(
+              "[AntiDup] skip repeated reply to {$to} on device {$device->id}"
+          );
+          return;
+      }
+      \Illuminate\Support\Facades\Cache::put($cacheKey, 1, 600);
+
       $this->messageSend(['text' => $text], $device->id, $to, 'plain-text', true, 0, true);
   }
 

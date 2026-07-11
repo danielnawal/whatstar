@@ -26,6 +26,20 @@
             "request": "user\/device*"
         },
         {
+            "name": "My Apps",
+            "icon": "fas fa-cube",
+            "route": "user.apps.index",
+            "route_type": "route",
+            "request": "user\/apps*"
+        },
+        {
+            "name": "Salud de bots",
+            "icon": "fas fa-heartbeat",
+            "route": "user\/health",
+            "route_type": "url",
+            "request": "user\/health*"
+        },
+        {
             "name": "Templates",
             "icon": "fi  fi-rs-template-alt",
             "route": "user\/template",
@@ -68,6 +82,27 @@
             "request": "user\/chatbot-widget*"
         },
         {
+            "name": "Plantillas industria",
+            "icon": "fas fa-magic",
+            "route": "user\/chatbot-industries",
+            "route_type": "url",
+            "request": "user\/chatbot-industries*"
+        },
+        {
+            "name": "Cerebro IA del bot",
+            "icon": "fas fa-brain",
+            "route": "user\/ai-config",
+            "route_type": "url",
+            "request": "user\/ai-config*"
+        },
+        {
+            "name": "Constructor visual",
+            "icon": "fas fa-project-diagram",
+            "route": "user\/chatbot-flow",
+            "route_type": "url",
+            "request": "user\/chatbot-flow*"
+        },
+        {
             "name": "Leads CRM",
             "icon": "fas fa-funnel-dollar",
             "route": "user\/leads",
@@ -75,18 +110,18 @@
             "request": "user\/leads*"
         },
         {
+            "name": "Alertas multi-canal",
+            "icon": "fas fa-bell",
+            "route": "user\/alerts",
+            "route_type": "url",
+            "request": "user\/alerts*"
+        },
+        {
             "name": "Bandeja Asesores",
             "icon": "fas fa-headset",
             "route": "user\/handoffs",
             "route_type": "url",
             "request": "user\/handoffs*"
-        },
-        {
-            "name": "My Apps",
-            "icon": "fas fa-cube",
-            "route": "user.apps.index",
-            "route_type": "route",
-            "request": "user\/apps*"
         },
         {
             "name": "Contact Book",
@@ -124,7 +159,7 @@
             "request": "user\/webhooks*"
         },
         {
-            "name": "Guía de uso",
+            "name": "Manual",
             "icon": "fas fa-book-open",
             "route": "user.manual.index",
             "route_type": "route",

@@ -89,6 +89,12 @@ class BotConversationalService
             return null;
         }
 
+        // Si el device tiene config y AI está deshabilitado, no llamar LLM.
+        $aiConfig = \App\Models\DeviceAiConfig::where('device_id', $device->id)->first();
+        if ($aiConfig && !$aiConfig->ai_enabled) {
+            return null;
+        }
+
         $message = trim($message);
         if ($message === '') return null;
         if (mb_strlen($message) > self::MAX_INPUT_CHARS) {
@@ -99,7 +105,7 @@ class BotConversationalService
         $lang    = $session->locked_language ?: 'auto';
         $known   = json_decode($session->lead_data ?? '{}', true) ?: [];
 
-        $system   = $this->systemPrompt();
+        $system   = $this->systemPrompt($aiConfig);
         $userMsg  = $this->buildUserContext($message, $history, $lang, $known);
 
         // Cache solo si no hay historial (primer turno) — turnos posteriores
@@ -229,11 +235,29 @@ class BotConversationalService
         return $ctx;
     }
 
-    private function systemPrompt(): string
+    private function systemPrompt(?\App\Models\DeviceAiConfig $aiConfig = null): string
     {
+        // Si el device tiene prompt 100% personalizado, usarlo tal cual.
+        if ($aiConfig && !$aiConfig->use_default_prompt && !empty($aiConfig->custom_system_prompt)) {
+            return $aiConfig->custom_system_prompt;
+        }
+
         $intents = implode(', ', array_keys(self::INTENT_TO_RULE_ID)) . ', unknown';
 
-        return <<<TXT
+        $businessSection = '';
+        if ($aiConfig) {
+            if (!empty($aiConfig->business_name)) {
+                $businessSection .= "\nNEGOCIO: " . $aiConfig->business_name;
+            }
+            if (!empty($aiConfig->industry)) {
+                $businessSection .= "\nINDUSTRIA: " . $aiConfig->industry;
+            }
+            if (!empty($aiConfig->business_context)) {
+                $businessSection .= "\nCONTEXTO:\n" . trim($aiConfig->business_context);
+            }
+        }
+
+        $base = <<<TXT
 Bot de venta APPOGIO (SaaS GPS marca blanca). Devuelve SOLO JSON:
 {"intent":"<{$intents}>","language":"es|en|pt","sentiment":"positive|neutral|negative|urgent","lead_data_extracted":{"nombre":"","cantidad_dispositivos":0,"empresa":""},"reply_text":null}
 
@@ -267,6 +291,7 @@ REGLAS DURAS:
 DATOS APPOGIO (solo si reply_text):
 +10 años LATAM, +3.800 modelos GPS, +80 informes. Equipos: Colombia/Ecuador. Software: cualquier país. Precios USD/mes: 1-25u $1, 26-100u $1, 101-200u $0.75, 200+u $0.50 (anuales: $7/$6/$6/$5; +200u APP GRATIS). Pagos: PayPal/Wompi. Horario humano: 8-19 Colombia.
 TXT;
+        return $base . $businessSection;
     }
 
     /**

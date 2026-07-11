@@ -36,7 +36,7 @@ class CronController extends Controller
               $hook->status_code = $responseStatus;
               $hook->save();
 
-         } catch (Exception $e) {
+         } catch (\Throwable $e) {
               $hook = Webhook::where('id',$row->id)->first();
               $hook->status = 0;
               $hook->status_code = 500;
@@ -158,7 +158,7 @@ class CronController extends Controller
                     $response= $this->messageSend($message,$device_id,$contact->phone,$type,true);
                 }
 
-                if ($response['status'] == 200) {
+                if (is_array($response) && ($response['status'] ?? null) == 200) {
                     $logs['user_id']=$data->user_id;
                     $logs['device_id']=$device_id;
                     $logs['from']=$from;
@@ -169,7 +169,7 @@ class CronController extends Controller
 
 
                 $status=200;
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
                 $status=500;
             }
         }

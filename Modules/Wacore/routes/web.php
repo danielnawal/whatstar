@@ -73,6 +73,30 @@ Route::group(['prefix' => 'user', 'as' => 'user.', 'middleware' => ['auth','user
    Route::get('chatbot-stats',                           [USER\ChatbotStatsController::class, 'index'])->name('chatbot.stats.index');
    //chatbot widget
    Route::get('chatbot-widget',                          [USER\ChatbotWidgetController::class, 'index'])->name('chatbot.widget.index');
+   //chatbot industry templates (presets pre-armados)
+   Route::get('chatbot-industries',                      [USER\ChatbotIndustryController::class, 'index'])->name('chatbot.industries.index');
+   Route::post('chatbot-industries/install',             [USER\ChatbotIndustryController::class, 'install'])->name('chatbot.industries.install');
+   //device health + reconexión guiada
+   Route::get('health',                                  [USER\DeviceHealthController::class, 'index'])->name('health.index');
+   Route::get('health/statuses',                         [USER\DeviceHealthController::class, 'statuses'])->name('health.statuses');
+   Route::post('health/reconnect/{id}',                  [USER\DeviceHealthController::class, 'reconnect'])->name('health.reconnect');
+   Route::get('health/qr/{id}',                          [USER\DeviceHealthController::class, 'qr'])->name('health.qr');
+   Route::post('health/alert-number/{id}',               [USER\DeviceHealthController::class, 'saveAlertNumber'])->name('health.alert');
+   //AI config por device (desacoplar prompt LLM)
+   Route::get('ai-config',                               [USER\DeviceAiConfigController::class, 'index'])->name('ai-config.index');
+   Route::get('ai-config/{deviceId}',                    [USER\DeviceAiConfigController::class, 'edit'])->name('ai-config.edit');
+   Route::post('ai-config/{deviceId}',                   [USER\DeviceAiConfigController::class, 'save'])->name('ai-config.save');
+   //constructor visual de flujos chatbot
+   Route::get('chatbot-flow',                            [USER\ChatbotFlowController::class, 'index'])->name('chatbot.flow.index');
+   Route::post('chatbot-flow',                           [USER\ChatbotFlowController::class, 'save'])->name('chatbot.flow.save');
+   //alert templates + rules (multi-canal)
+   Route::get('alerts',                                  [USER\AlertTemplateController::class, 'index'])->name('alerts.index');
+   Route::post('alerts/templates',                       [USER\AlertTemplateController::class, 'storeTemplate'])->name('alerts.templates.store');
+   Route::put('alerts/templates/{id}',                   [USER\AlertTemplateController::class, 'updateTemplate'])->name('alerts.templates.update');
+   Route::delete('alerts/templates/{id}',                [USER\AlertTemplateController::class, 'deleteTemplate'])->name('alerts.templates.delete');
+   Route::post('alerts/rules',                           [USER\AlertTemplateController::class, 'storeRule'])->name('alerts.rules.store');
+   Route::delete('alerts/rules/{id}',                    [USER\AlertTemplateController::class, 'deleteRule'])->name('alerts.rules.delete');
+   Route::post('alerts/preview',                         [USER\AlertTemplateController::class, 'preview'])->name('alerts.preview');
    //leads crm
    Route::get('leads',                                   [USER\LeadsController::class, 'index'])->name('leads.index');
    Route::get('leads/export',                            [USER\LeadsController::class, 'export'])->name('leads.export');

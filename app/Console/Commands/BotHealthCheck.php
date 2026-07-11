@@ -36,22 +36,44 @@ class BotHealthCheck extends Command
             // Modo single
             $devices = Device::where('id', (int) $deviceId)->get();
         } else {
-            // Modo multi-tenant: TODOS los devices que tengan creds.json o status=1
-            // (no devices que nunca se conectaron — esos no son problema)
+            // Monitorear TODOS los devices que alguna vez estuvieron activos.
+            // Criterio: status=1 en BD, O tienen store.json en sessions/
+            // (el store.json se crea al primer mensaje — es prueba de que el device estuvo activo).
+            // NO filtrar por status=1 solo, porque cuando un device se desconecta el
+            // servidor Node lo pone en status=0 y el health-check dejaría de monitorearlo
+            // (circulo vicioso: cae → status=0 → nadie detecta que sigue caído).
             $devices = Device::query();
             if (!$this->option('include-inactive')) {
-                $devices->where(function($q) {
-                    // status=1 OR tienen carpeta de creds (estuvieron activos en algún momento)
-                    $q->where('status', 1);
-                });
+                $devices->where('status', 1);
             }
             $devices = $devices->get();
 
-            // Filtrar: solo monitorear devices con CARPETA de sesión existente.
-            // Si la carpeta NUNCA existió, el device nunca se conectó (no es problema operativo).
-            // Si la carpeta existe pero creds.json falta → eso SÍ es problema (alertar).
-            $devices = $devices->filter(function($d) {
-                return is_dir("/var/www/html/whatstar/sessions/md_device_{$d->id}");
+            // Ampliar con devices status=0 que tengan store.json (estuvieron activos pero se cayeron)
+            if (!$this->option('include-inactive')) {
+                $sessionsDir = '/var/www/html/whatstar/sessions/';
+                $storeFiles  = glob($sessionsDir . 'device_*_store.json') ?: [];
+                $idsFromStore = [];
+                foreach ($storeFiles as $f) {
+                    if (preg_match('/device_(\d+)_store\.json$/', $f, $m)) {
+                        $idsFromStore[] = (int) $m[1];
+                    }
+                }
+                if ($idsFromStore) {
+                    $extra = Device::whereIn('id', $idsFromStore)
+                        ->where('status', 0)
+                        ->get();
+                    $devices = $devices->merge($extra)->unique('id');
+                }
+            } else {
+                $devices = $devices->get();
+            }
+
+            // Mantener solo devices con carpeta md_device_X (creds baileys) O store.json.
+            // Los que no tienen ninguno nunca se conectaron → ignorar.
+            $sessionsDir = '/var/www/html/whatstar/sessions/';
+            $devices = $devices->filter(function($d) use ($sessionsDir) {
+                return is_dir("{$sessionsDir}md_device_{$d->id}")
+                    || file_exists("{$sessionsDir}device_{$d->id}_store.json");
             });
         }
 
@@ -64,8 +86,19 @@ class BotHealthCheck extends Command
         $totalFail  = 0;
         $waUrl      = str_replace('localhost', '127.0.0.1', env('WA_SERVER_URL', 'http://127.0.0.1:8000'));
 
+        // Pre-cargar lista de sesiones activas una sola vez (evita N llamadas al servidor Node)
+        $activeSessions = [];
+        try {
+            $sessListResp = Http::timeout(5)->get($waUrl . '/sessions/list');
+            if ($sessListResp->successful()) {
+                $activeSessions = $sessListResp->json('data') ?? [];
+            }
+        } catch (\Throwable $e) {
+            Log::warning('[BotHealthCheck] No se pudo obtener /sessions/list: ' . $e->getMessage());
+        }
+
         foreach ($devices as $device) {
-            $result = $this->checkDevice($device, $waUrl);
+            $result = $this->checkDevice($device, $waUrl, $activeSessions);
             if ($result['ok']) {
                 $totalOk++;
                 Cache::forget("bot_alert_throttle:{$device->id}");
@@ -73,21 +106,25 @@ class BotHealthCheck extends Command
             }
 
             // Intento de auto-recovery ANTES de notificar al usuario
-            // Si funciona, el cliente ni se entera de que se cayó.
             if ($this->tryAutoRecover($device, $result['issues'])) {
-                // El WA Server necesita ~10-15s para detectar las creds restauradas
-                // y reconectar la sesión via Baileys
-                $this->info("  ⏳ esperando que WA Server detecte creds restauradas...");
+                $this->info("  esperando que WA Server detecte creds restauradas...");
                 sleep(15);
-                $reCheck = $this->checkDevice($device, $waUrl);
+                // Refrescar lista de sesiones tras el recovery
+                try {
+                    $refreshed = Http::timeout(5)->get($waUrl . '/sessions/list');
+                    if ($refreshed->successful()) {
+                        $activeSessions = $refreshed->json('data') ?? $activeSessions;
+                    }
+                } catch (\Throwable $e) { /* usar la lista anterior */ }
+
+                $reCheck = $this->checkDevice($device, $waUrl, $activeSessions);
                 if ($reCheck['ok']) {
-                    $this->info("  🔄 device_{$device->id} auto-recovered desde backup");
+                    $this->info("  device_{$device->id} auto-recovered desde backup");
                     Log::info("[BotHealthCheck] device_{$device->id} auto-recovered desde backup");
                     Cache::forget("bot_alert_throttle:{$device->id}");
                     $totalOk++;
                     continue;
                 }
-                // Si tras restore sigue caído, notificar al usuario
                 $result = $reCheck;
             }
 
@@ -99,33 +136,38 @@ class BotHealthCheck extends Command
         return $totalFail > 0 ? self::FAILURE : self::SUCCESS;
     }
 
-    private function checkDevice(Device $device, string $waUrl): array
+    private function checkDevice(Device $device, string $waUrl, array $activeSessions = []): array
     {
         $issues = [];
 
-        // Check 1: status DB
+        // Check 1: presente en la lista de sesiones activas del servidor Node
+        // Esta es la única fuente de verdad — si no está en la lista, no puede recibir mensajes.
+        $sessionKey = "device_{$device->id}";
+        if (!empty($activeSessions) && !in_array($sessionKey, $activeSessions)) {
+            $issues[] = "no está en sesiones activas del WA Server";
+        } elseif (empty($activeSessions)) {
+            // Si no pudimos obtener la lista, fallback al endpoint individual
+            try {
+                $resp = Http::timeout(8)->get($waUrl . '/sessions/find/' . $sessionKey);
+                if (!$resp->successful()) {
+                    $issues[] = "sesión no encontrada en WA Server (HTTP {$resp->status()})";
+                }
+            } catch (\Throwable $e) {
+                $issues[] = "WA Server unreachable: " . mb_substr($e->getMessage(), 0, 80);
+            }
+        }
+
+        // Check 2: status en BD (sincronizar si está desfasado)
         if ($device->status != 1) {
             $issues[] = "DB status={$device->status} (esperado 1)";
         }
 
-        // Check 2: WA Server endpoint
-        try {
-            $resp = Http::timeout(8)->get($waUrl . '/chats?id=device_' . $device->id);
-            if (!$resp->successful()) {
-                $issues[] = "WA Server: HTTP {$resp->status()}";
-            }
-        } catch (\Throwable $e) {
-            $issues[] = "WA Server: " . mb_substr($e->getMessage(), 0, 80);
-        }
-
-        // Check 3: creds.json existe
-        $credsPath = "/var/www/html/whatstar/sessions/md_device_{$device->id}/creds.json";
-        if (!file_exists($credsPath)) {
-            $issues[] = "creds.json missing";
-        }
-
         if (empty($issues)) {
-            $this->line("  ✅ device_{$device->id} ({$device->phone}): healthy");
+            // Si el device está OK pero la BD dice 0 (caso raro), corregir BD
+            if ($device->status != 1) {
+                \DB::table('devices')->where('id', $device->id)->update(['status' => 1]);
+            }
+            $this->line("  device_{$device->id} ({$device->phone}): ok");
             return ['ok' => true];
         }
 
@@ -186,6 +228,23 @@ class BotHealthCheck extends Command
         $reconnectUrl = env('APP_URL', 'http://167.86.111.199')
                       . '/user/device/' . $device->uuid . '/qr';
 
+        $waUrl = str_replace('localhost', '127.0.0.1', env('WA_SERVER_URL', 'http://127.0.0.1:8000'));
+
+        // Pre-arrancar la sesión en modo QR para que el panel muestre el código inmediatamente.
+        // Si la sesión ya existe (reconectando) la ignoramos.
+        try {
+            $sessCheck = Http::timeout(4)->get("{$waUrl}/sessions/find/device_{$device->id}");
+            if (!$sessCheck->successful()) {
+                Http::timeout(10)->post("{$waUrl}/sessions/add", [
+                    'id'       => "device_{$device->id}",
+                    'typeAuth' => 'qr',
+                ]);
+                Log::info("[BotHealthCheck] Sesión QR pre-arrancada para device_{$device->id}");
+            }
+        } catch (\Throwable $e) {
+            Log::warning("[BotHealthCheck] No se pudo pre-arrancar sesión: " . $e->getMessage());
+        }
+
         // Mensaje específico según plan del usuario:
         //  - Plan Starlink (id=4): el número se usa para alertas GPS automáticas a clientes
         //  - Plan BASICO/EMPRESA (5,6): el número es un BOT que responde clientes
@@ -194,7 +253,6 @@ class BotHealthCheck extends Command
 
         // Itera hasta 5 emisores candidatos, usa el primero que responda
         $emitters = $this->findEmitterCandidates($device, 5);
-        $waUrl    = str_replace('localhost', '127.0.0.1', env('WA_SERVER_URL', 'http://127.0.0.1:8000'));
 
         foreach ($emitters as $emitter) {
             try {

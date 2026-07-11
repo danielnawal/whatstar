@@ -391,6 +391,18 @@ print(response.text)
                     </div>
                     <div class="card-body">
 
+                        {{-- ── Aclaración importante para el cliente ── --}}
+                        <div class="mb-4" style="background:#eef6ff; border:1px solid #cfe0f4; color:#12365f; border-radius:12px; padding:1.1rem 1.3rem;">
+                            <h6 class="font-weight-bold mb-2" style="font-size:1.05rem;">
+                                <i class="fas fa-info-circle mr-2"></i>{{ __('Léelo una vez — es muy fácil') }}
+                            </h6>
+                            <ul class="mb-0" style="padding-left:1.15rem; line-height:1.75;">
+                                <li>{{ __('Este enlace se copia en tu software GPS UNA SOLA VEZ. Cuando ya está pegado, NO tienes que volver a copiarlo ni pegarlo nunca más.') }}</li>
+                                <li>{{ __('Solo necesitas crear OTRA App si vas a usar un número de WhatsApp DIFERENTE para enviar las alertas. Si es el mismo número, con esta App ya quedó listo para siempre.') }}</li>
+                                <li>{{ __('Para activar el envío, lo único que haces es escanear el código QR: entra a "Mis Dispositivos" (My Devices) en el menú de la izquierda, haz clic en el ícono de QR de tu número y escanéalo con la app de WhatsApp de tu teléfono. También puedes escanearlo desde "Salud de bots".') }}</li>
+                            </ul>
+                        </div>
+
                         {{-- ── SMS Gateway para software GPS ── --}}
                         <div class="card border-0 mb-4" style="background:#f0f7ff; border-left:4px solid #0d6efd !important; border-left-style:solid !important;">
                             <div class="card-body py-3">
@@ -408,28 +420,28 @@ print(response.text)
                                 <div class="row mb-2">
                                     <div class="col-md-3 col-sm-6 mb-2">
                                         <span class="text-muted small d-block">{{ __('Habilitar gateway SMS') }}</span>
-                                        <span class="badge badge-success px-3 py-2" style="font-size:.85rem;">✔ SÍ</span>
+                                        <span class="badge badge-success px-3 py-2" style="font-size:.9rem;">{{ __('SÍ') }}</span>
                                     </div>
                                     <div class="col-md-3 col-sm-6 mb-2">
                                         <span class="text-muted small d-block">{{ __('Solicitud método') }}</span>
-                                        <span class="badge badge-primary px-3 py-2" style="font-size:.85rem;">POST</span>
+                                        <span class="badge badge-primary px-3 py-2" style="font-size:.9rem;">POST</span>
                                     </div>
                                     <div class="col-md-3 col-sm-6 mb-2">
                                         <span class="text-muted small d-block">{{ __('Codificación') }}</span>
-                                        <span class="badge badge-secondary px-3 py-2" style="font-size:.85rem;">✖ NO</span>
+                                        <span class="badge badge-secondary px-3 py-2" style="font-size:.9rem;">{{ __('NO') }}</span>
                                     </div>
                                     <div class="col-md-3 col-sm-6 mb-2">
                                         <span class="text-muted small d-block">{{ __('Autenticación') }}</span>
-                                        <span class="badge badge-secondary px-3 py-2" style="font-size:.85rem;">✖ NO</span>
+                                        <span class="badge badge-secondary px-3 py-2" style="font-size:.9rem;">{{ __('NO') }}</span>
                                     </div>
                                 </div>
 
                                 <div class="mb-2">
                                     <span class="text-muted small d-block mb-1">{{ __('Cabeceras de puerta de enlace de SMS') }} <em class="text-muted">({{ __('y también') }}: SMS gateway URL)</em></span>
                                     <div class="input-group">
-                                        <input type="text" id="sms-gw-url" class="form-control form-control-sm" style="font-family:monospace;font-size:.78rem;" readonly value="{{ $smsGwUrl }}">
+                                        <input type="text" id="sms-gw-url" class="form-control" style="font-family:monospace;font-size:.9rem;" readonly value="{{ $smsGwUrl }}">
                                         <div class="input-group-append">
-                                            <button class="btn btn-sm btn-primary" onclick="copySmsGwUrl()" type="button">
+                                            <button class="btn btn-primary" onclick="whatstarCopy('sms-gw-url', this)" type="button">
                                                 <i class="fas fa-copy mr-1"></i>{{ __('Copiar') }}
                                             </button>
                                         </div>
@@ -445,8 +457,20 @@ print(response.text)
                         </div>
 
                         <h5 class="font-weight-bold mb-2">{{ __('URL Webhook de Alertas') }}</h5>
-                        <p class="text-muted small mb-1">{{ __('Copia esta URL en la configuración de alertas de tu software GPS. Reemplaza los parámetros entre llaves {}.') }}</p>
-                        <pre class="language-markup p-3 bg-light rounded" style="font-size:.78rem; word-break:break-all; white-space:pre-wrap;">{{ url('/appogio/alert') }}?appkey={{ $key }}&amp;outkey={OUT_KEY}&amp;to={TELEFONO}&amp;unit={UNIDAD}&amp;event={EVENTO}&amp;speed={VELOCIDAD}&amp;lat={LAT}&amp;lng={LNG}&amp;address={DIRECCION}</pre>
+                        <p class="text-muted mb-2">{{ __('Copia esta URL en la configuración de alertas de tu software GPS. Reemplaza los parámetros entre llaves {}.') }}</p>
+                        @php
+                            $webhookUrl = url('/appogio/alert')
+                                . '?appkey=' . $key
+                                . '&outkey={OUT_KEY}&to={TELEFONO}&unit={UNIDAD}&event={EVENTO}&speed={VELOCIDAD}&lat={LAT}&lng={LNG}&address={DIRECCION}';
+                        @endphp
+                        <div class="input-group mb-1">
+                            <input type="text" id="webhook-url" class="form-control" style="font-family:monospace;font-size:.9rem;" readonly value="{{ $webhookUrl }}">
+                            <div class="input-group-append">
+                                <button class="btn btn-primary" onclick="whatstarCopy('webhook-url', this)" type="button">
+                                    <i class="fas fa-copy mr-1"></i>{{ __('Copiar') }}
+                                </button>
+                            </div>
+                        </div>
 
                         <h5 class="font-weight-bold mt-4 mb-2">{{ __('Parámetros del Webhook') }}</h5>
                         <div class="table-responsive">
@@ -475,29 +499,67 @@ print(response.text)
                         </div>
 
                         <h5 class="font-weight-bold mt-4 mb-2">{{ __('Ejemplo de mensaje que recibirá el conductor/responsable') }}</h5>
-                        <div class="bg-light p-3 rounded" style="font-family:monospace; font-size:.85rem; white-space:pre-line;">🚨 <strong>Alerta [Nombre de tu empresa]</strong>
-📦 <strong>Unidad:</strong> Camión 01
-⚡ <strong>Evento:</strong> Exceso de velocidad
-🚗 <strong>Velocidad:</strong> 120 km/h
-📍 <strong>Dirección:</strong> Calle 80 #45-23, Bogotá
-🗺 <strong>Mapa:</strong> https://maps.google.com/?q=4.6097,-74.0817
-🕐 <strong>Hora:</strong> 2026-04-23 14:35:00</div>
+                        <div class="bg-light p-3 rounded" style="font-family:monospace; font-size:.95rem; line-height:1.7; white-space:pre-line;"><strong>[Nombre de tu empresa]</strong>
+<strong>Unidad:</strong> Camión 01
+<strong>Evento:</strong> Exceso de velocidad
+<strong>Velocidad:</strong> 120 km/h
+<strong>Dirección:</strong> Calle 80 #45-23, Bogotá
+<strong>Mapa:</strong> https://maps.google.com/?q=4.6097,-74.0817
+<strong>Hora:</strong> 2026-04-23 14:35:00</div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-@push('scripts')
+@push('bottomjs')
 <script>
-function copySmsGwUrl() {
-    var input = document.getElementById('sms-gw-url');
-    navigator.clipboard.writeText(input.value).then(function() {
-        var btn = input.parentElement.nextElementSibling.querySelector('button');
-        var orig = btn.innerHTML;
+function whatstarCopy(sourceId, btn) {
+    var el = document.getElementById(sourceId);
+    if (!el) { return; }
+    var text = (el.value !== undefined && el.value !== null) ? el.value : el.textContent;
+
+    function markCopied() {
+        var orig = btn.getAttribute('data-orig-label');
+        if (orig === null) { orig = btn.innerHTML; btn.setAttribute('data-orig-label', orig); }
         btn.innerHTML = '<i class="fas fa-check mr-1"></i>Copiado';
-        btn.classList.replace('btn-primary', 'btn-success');
-        setTimeout(function() { btn.innerHTML = orig; btn.classList.replace('btn-success', 'btn-primary'); }, 2000);
-    });
+        btn.classList.remove('btn-primary');
+        btn.classList.add('btn-success');
+        setTimeout(function () {
+            btn.innerHTML = orig;
+            btn.classList.remove('btn-success');
+            btn.classList.add('btn-primary');
+        }, 2000);
+    }
+
+    function legacyCopy() {
+        try {
+            if (typeof el.select === 'function') {
+                el.removeAttribute('readonly');
+                el.focus();
+                el.select();
+                el.setSelectionRange(0, text.length);
+            } else {
+                var range = document.createRange();
+                range.selectNodeContents(el);
+                var sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+            var ok = document.execCommand('copy');
+            if (window.getSelection) { window.getSelection().removeAllRanges(); }
+            if (el.setAttribute) { el.setAttribute('readonly', 'readonly'); }
+            if (ok) { markCopied(); }
+            else { alert('No se pudo copiar. Selecciona el texto y usa Ctrl+C.'); }
+        } catch (e) {
+            alert('No se pudo copiar. Selecciona el texto y usa Ctrl+C.');
+        }
+    }
+
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(markCopied).catch(legacyCopy);
+    } else {
+        legacyCopy();
+    }
 }
 </script>
 @endpush
