@@ -16,6 +16,8 @@ class VerifyCsrfToken extends Middleware
         '/install/migrate',
         '/install/verify',
         'appogio/alert',
+        'appogio/reminder',
+        'appogio/status',
         'appogio/sso',
         'appogio/get-qr/*',
         'appogio/check-session/*',

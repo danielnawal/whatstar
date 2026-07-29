@@ -30,6 +30,10 @@ Route::prefix('appogio')->group(function () {
     Route::post('generate-token/{uuid}', [App\Http\Controllers\AppogioController::class, 'generateToken'])->name('appogio.token');
     // Webhook receptor de alertas (GET y POST para máxima compatibilidad con Appogio)
     Route::match(['get', 'post'], 'alert', [App\Http\Controllers\AppogioController::class, 'alert'])->name('appogio.alert');
+    // Envío de recordatorio (Remindo -> whatstar): resuelve el número del distribuidor por su correo
+    Route::post('reminder', [App\Http\Controllers\AppogioController::class, 'reminder'])->name('appogio.reminder');
+    // Estado del número de alertas (panel GPS -> whatstar): ¿conectado o no?
+    Route::post('status', [App\Http\Controllers\AppogioController::class, 'status'])->name('appogio.status');
 
     // SSO: login automático desde el launcher de Appogio (sin usuario/contraseña)
     Route::match(['get', 'post'], 'sso', [App\Http\Controllers\AppogioController::class, 'sso'])->name('appogio.sso');

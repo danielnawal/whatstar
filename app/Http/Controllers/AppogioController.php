@@ -517,4 +517,175 @@ class AppogioController extends Controller
 
         return implode("\n", $lines);
     }
+
+    /**
+     * Envío de RECORDATORIO (ej. vencimiento de unidad anual) desde el número del DISTRIBUIDOR,
+     * resuelto por su CORREO. Lo llama Remindo (server-to-server, firmado con APPOGIO_PRIMARY_SECRET).
+     * No necesita que el llamante pase appkey/outkey: whatstar resuelve el número conectado por email.
+     * POST /appogio/reminder  { email, to, message, secret }
+     *   to = uno o varios números separados por , o ;  (máximo 4, como permite WhatsApp).
+     * Devuelve {success, reason?, from?, results[]}. Solo envía si el distribuidor tiene su
+     * número CONECTADO en whatstar; si no, responde 'numero_no_conectado' y no envía nada.
+     */
+    public function reminder(Request $request)
+    {
+        $secret   = (string) $request->input('secret', '');
+        $expected = (string) env('APPOGIO_PRIMARY_SECRET', '');
+        if ($expected === '' || !hash_equals($expected, $secret)) {
+            return response()->json(['success' => false, 'reason' => 'secreto_invalido'], 401);
+        }
+
+        $rlKey = 'appogio-reminder:' . ($request->input('email') ?: $request->ip());
+        if (RateLimiter::tooManyAttempts($rlKey, 60)) {
+            return response()->json(['success' => false, 'reason' => 'rate_limit'], 429);
+        }
+        RateLimiter::hit($rlKey, 60);
+
+        $email   = strtolower(trim((string) $request->input('email', '')));
+        $to      = (string) $request->input('to', '');
+        $message = trim((string) $request->input('message', ''));
+        if ($email === '' || $to === '' || $message === '') {
+            return response()->json(['success' => false, 'reason' => 'datos_incompletos'], 400);
+        }
+
+        // Resolver distribuidor por correo -> su app -> su dispositivo (número) CONECTADO.
+        $user = User::where('email', $email)->where('status', 1)->first();
+        if (!$user) {
+            return response()->json(['success' => false, 'reason' => 'distribuidor_sin_whatstar'], 200);
+        }
+        $app = App::where('user_id', $user->id)->where('status', 1)
+                  ->whereHas('device')->with('device')->first();
+        $device = $app ? $app->device : null;
+        if (!$device) {
+            return response()->json(['success' => false, 'reason' => 'sin_dispositivo'], 200);
+        }
+        if ((int) $device->status !== 1) {
+            return response()->json(['success' => false, 'reason' => 'numero_no_conectado'], 200);
+        }
+        // Antes se enviaba a ciegas: el gateway aceptaba la petición y devolvía
+        // results[].status = 'failed', así que quien llamaba creía que había salido.
+        $viva = $this->sesionViva($device->id);
+        $this->corregirSiMiente($device, $viva);
+        if ($viva !== true) {
+            return response()->json([
+                'success' => false,
+                'reason'  => $viva === false ? 'sesion_caida' : 'servidor_whatsapp_no_responde',
+                'from'    => $device->phone,
+            ], 200);
+        }
+
+        // Destinatarios: separar por , o ; ; limpiar a dígitos; máximo 4.
+        $recipients = preg_split('/[,;]+/', $to);
+        $results = [];
+        $count = 0;
+        foreach ($recipients as $phone) {
+            $phone = preg_replace('/\D/', '', (string) $phone);
+            if ($phone === '') { continue; }
+            if ($count >= 4) { break; }
+            $count++;
+            try {
+                $resp = Http::timeout(20)->post(
+                    env('WA_SERVER_URL') . '/chats/send?id=device_' . $device->id,
+                    ['receiver' => $phone, 'message' => ['text' => $message]]
+                );
+                $results[] = ['to' => $phone, 'status' => $resp->status() === 200 ? 'sent' : 'failed'];
+            } catch (\Throwable $e) {
+                $results[] = ['to' => $phone, 'status' => 'error'];
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'from'    => $device->phone ?? null,
+            'results' => $results,
+        ]);
+    }
+
+    /**
+     * Estado del número de alertas de un distribuidor: ¿tiene su WhatsApp CONECTADO?
+     * Lo llama el panel GPS (server-to-server, firmado) para mostrar un indicador
+     * "WhatsApp de alertas: conectado / no conectado". Resuelve por `appkey` (que el panel ya
+     * tiene guardado en sms_gateway_url) o por `email` del distribuidor.
+     * POST /appogio/status  { appkey | email, secret }  →  { success, connected, phone }
+     */
+    public function status(Request $request)
+    {
+        $secret   = (string) $request->input('secret', '');
+        $expected = (string) env('APPOGIO_PRIMARY_SECRET', '');
+        if ($expected === '' || !hash_equals($expected, $secret)) {
+            return response()->json(['success' => false, 'reason' => 'secreto_invalido'], 401);
+        }
+
+        $appkey = trim((string) $request->input('appkey', ''));
+        $email  = strtolower(trim((string) $request->input('email', '')));
+
+        $app = null;
+        if ($appkey !== '') {
+            $app = App::where('key', $appkey)->with('device')->first();
+        } elseif ($email !== '') {
+            $user = User::where('email', $email)->where('status', 1)->first();
+            if ($user) {
+                $app = App::where('user_id', $user->id)->where('status', 1)
+                          ->whereHas('device')->with('device')->first();
+            }
+        } else {
+            return response()->json(['success' => false, 'reason' => 'falta_appkey_o_email'], 400);
+        }
+
+        $device = $app ? $app->device : null;
+        if (!$device) {
+            return response()->json(['success' => true, 'connected' => false, 'reason' => 'sin_dispositivo']);
+        }
+        // La verdad la tiene el servidor de WhatsApp, no la columna `status`.
+        $viva = $this->sesionViva($device->id);
+        $this->corregirSiMiente($device, $viva);
+        $conectado = ((int) $device->status === 1) && ($viva === true);
+        $motivo = null;
+        if (!$conectado) {
+            if ($viva === false)      { $motivo = 'sesion_caida'; }
+            elseif ($viva === null)   { $motivo = 'servidor_whatsapp_no_responde'; }
+            else                      { $motivo = 'numero_no_conectado'; }
+        }
+        return response()->json(array_filter([
+            'success'   => true,
+            'connected' => $conectado,
+            'phone'     => $device->phone,
+            'name'      => $device->name,
+            'reason'    => $motivo,
+        ], function ($v) { return $v !== null; }));
+    }
+
+    /**
+     * ¿La sesión de WhatsApp de este número está VIVA en el servidor?
+     * Devuelve: true (viva), false (el servidor dice que no existe), null (no se pudo saber).
+     * El null importa: si el servidor de WhatsApp no contesta, no se puede afirmar que el
+     * cliente esté desconectado, y mucho menos corregirle la base por una suposición.
+     */
+    private function sesionViva($deviceId)
+    {
+        try {
+            $r = Http::timeout(4)->get(env('WA_SERVER_URL') . '/sessions/status/device_' . $deviceId);
+            if ($r->status() === 404) { return false; }
+            if (!$r->successful()) { return null; }
+            $estado = data_get($r->json(), 'data.status');
+            return $estado === 'authenticated';
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * La base decía "conectado" y el servidor dice que esa sesión no existe: se corrige.
+     * No se avisa al cliente desde aquí a propósito: esto es una consulta, y una consulta no
+     * debe mandarle un WhatsApp a nadie. El aviso lo hace el trabajo de reconciliación.
+     */
+    private function corregirSiMiente($device, $viva)
+    {
+        if ($viva === false && (int) $device->status === 1) {
+            $device->status = 0;
+            $device->save();
+            \Log::info('[appogio] device ' . $device->id . ' decía conectado y su sesión no existe: corregido a 0');
+        }
+    }
+
 }
