@@ -309,7 +309,17 @@ const createSession = async (sessionId, res = null, options = { usePairingCode: 
                     await axios.post(`${APP_URL}/api/set-device-status/${sessionId}/0`)
                 } catch {}
 
-                return deleteSession(sessionId)
+                // Las credenciales SOLO se borran si WhatsApp desvinculo el numero de verdad.
+                // Si nada mas se acabaron los reintentos (corte de red, servidor saturado, la
+                // caida por memoria), se deja la sesion intacta: conserva sus credenciales en
+                // sessions/md_<id> y el proximo arranque la recupera sola.
+                // Antes se borraban SIEMPRE, y por eso se perdian numeros buenos que luego
+                // tocaba re-vincular por QR.
+                if (statusCode === DisconnectReason.loggedOut) {
+                    return deleteSession(sessionId)
+                }
+
+                return
             }
 
             setTimeout(
@@ -374,6 +384,27 @@ const deleteSession = (sessionId) => {
     const sessionFile = 'md_' + sessionId
     const storeFile = `${sessionId}_store.json`
     const rmOptions = { force: true, recursive: true }
+
+    // Apaga el almacen ANTES de borrar los archivos.
+    // Sin esto el almacen quedaba vivo con su temporizador de autoguardado:
+    // seguia ocupando toda su memoria y volvia a crear el archivo borrado cada
+    // 5 minutos. Esa fuga era la que mataba el proceso con
+    // "JavaScript heap out of memory" y desconectaba los dispositivos.
+    const sesionQueSeVa = sessions.get(sessionId)
+    if (sesionQueSeVa?.store) {
+        try {
+            const almacen = sesionQueSeVa.store
+            if (almacen.autoSaveTimer) {
+                clearInterval(almacen.autoSaveTimer)
+                almacen.autoSaveTimer = null
+            }
+            almacen.removeAllListeners()
+            almacen.chats.clear()
+            almacen.messages.clear()
+            almacen.contacts.clear()
+            almacen.groupMetadata.clear()
+        } catch {}
+    }
 
     rmSync(sessionsDir(sessionFile), rmOptions)
     rmSync(sessionsDir(storeFile), rmOptions)

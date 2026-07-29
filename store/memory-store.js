@@ -821,19 +821,28 @@ class ConcurrentStore extends EventEmitter {
         // Build the set of JIDs that survived pruning
         const keptJids = new Set(chatEntries.map(([jid]) => jid));
 
+        // Purga TAMBIEN en memoria, no solo en el archivo. Sin esto los Map crecen
+        // sin limite y el proceso muere con "JavaScript heap out of memory":
+        // el archivo ya estaba acotado, la RAM no.
+        if (cutoffMs > 0 || maxChats > 0) {
+            const removed = this.chats.size - keptJids.size;
+            for (const jid of [...this.chats.keys()]) {
+                if (!keptJids.has(jid)) this.chats.delete(jid);
+            }
+            for (const jid of [...this.messages.keys()]) {
+                if (!keptJids.has(jid)) this.messages.delete(jid);
+            }
+            if (removed > 0) {
+                console.log(`[store] pruned ${removed} inactive chats — kept ${keptJids.size}`);
+            }
+        }
+
         // Remove messages for pruned chats
         const prunedMessages = Object.fromEntries(
             [...this.messages.entries()]
                 .filter(([jid]) => keptJids.has(jid))
                 .map(([jid, msgs]) => [jid, [...msgs.entries()]])
         );
-
-        if (cutoffMs > 0 || maxChats > 0) {
-            const removed = this.chats.size - keptJids.size;
-            if (removed > 0) {
-                console.log(`[store] pruned ${removed} inactive chats — kept ${keptJids.size}`);
-            }
-        }
         // --- end pruning ---
 
         return {
